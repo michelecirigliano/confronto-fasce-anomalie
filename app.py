@@ -1,356 +1,620 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, date, time, timedelta
 import re
+import unicodedata
+from openpyxl import load_workbook
+
 
 st.set_page_config(
-    page_title="Confronto fasce e anomalie",
+    page_title="Confronto fasce PD e anomalie",
     layout="wide"
 )
 
-st.title("Confronto fasce e anomalie")
+st.title("Confronto fasce PD e anomalie")
 st.write(
-    "App per confrontare due file Excel e rilevare possibili sovrapposizioni "
-    "tra fasce/orari riferite alla stessa matricola e alla stessa data."
+    "L'app confronta il file Anomalie con il file Pianificazione PD, "
+    "ricostruendo le timbrature da Ent./Usc. e confrontandole con le fasce "
+    "di pronta disponibilità associate al nominativo."
 )
 
-# =========================
-# FUNZIONI DI SUPPORTO
-# =========================
 
-def carica_excel(file):
+# ============================================================
+# FUNZIONI BASE
+# ============================================================
+
+def normalizza_testo(valore):
+    if valore is None or pd.isna(valore):
+        return ""
+
+    testo = str(valore).strip().upper()
+
+    testo = unicodedata.normalize("NFKD", testo)
+    testo = "".join(c for c in testo if not unicodedata.combining(c))
+
+    testo = re.sub(r"[^A-Z0-9 ]+", " ", testo)
+    testo = re.sub(r"\s+", " ", testo).strip()
+
+    return testo
+
+
+def normalizza_nome(cognome, nome):
+    return normalizza_testo(f"{cognome} {nome}")
+
+
+def nominativo_match(cognome, nome, testo_pianificazione):
+    """
+    Verifica se Cognome + Nome del file Anomalie è contenuto
+    nella Decodifica di Matricola del file Pianificazione PD.
+    Gestisce piccoli scostamenti di spazi, maiuscole, punteggiatura.
+    """
+
+    cognome_norm = normalizza_testo(cognome)
+    nome_norm = normalizza_testo(nome)
+    testo_norm = normalizza_testo(testo_pianificazione)
+
+    if not cognome_norm or not nome_norm or not testo_norm:
+        return False
+
+    nominativo_1 = f"{cognome_norm} {nome_norm}"
+    nominativo_2 = f"{nome_norm} {cognome_norm}"
+
+    if nominativo_1 in testo_norm:
+        return True
+
+    if nominativo_2 in testo_norm:
+        return True
+
+    # fallback: controllo che tutte le parole principali siano presenti
+    parole = [p for p in nominativo_1.split() if len(p) > 1]
+    return all(p in testo_norm for p in parole)
+
+
+def make_unique_headers(headers):
+    """
+    Replica il comportamento di pandas per colonne duplicate:
+    Nome, Nome.1, Nome.2...
+    """
+    result = []
+    counts = {}
+
+    for h in headers:
+        if h is None:
+            h = ""
+        h = str(h).strip()
+
+        if h == "":
+            h = "Colonna"
+
+        if h not in counts:
+            counts[h] = 0
+            result.append(h)
+        else:
+            counts[h] += 1
+            result.append(f"{h}.{counts[h]}")
+
+    return result
+
+
+def leggi_excel_righe_visibili(uploaded_file, solo_visibili=True):
+    """
+    Legge il primo foglio Excel usando openpyxl.
+    Se solo_visibili=True, ignora le righe nascoste dal filtro Excel.
+    """
+
+    uploaded_file.seek(0)
+    wb = load_workbook(uploaded_file, data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=False))
+
+    if not rows:
+        return pd.DataFrame(), 0, 0
+
+    # Trova la prima riga plausibile come intestazione
+    header_row_index = None
+    for idx, row in enumerate(rows, start=1):
+        values = [cell.value for cell in row]
+        non_empty = [v for v in values if v is not None and str(v).strip() != ""]
+        if len(non_empty) >= 3:
+            header_row_index = idx
+            headers = make_unique_headers(values)
+            break
+
+    if header_row_index is None:
+        return pd.DataFrame(), 0, 0
+
+    data = []
+    righe_totali = 0
+    righe_lette = 0
+
+    for row_idx in range(header_row_index + 1, ws.max_row + 1):
+        righe_totali += 1
+
+        hidden = ws.row_dimensions[row_idx].hidden
+
+        if solo_visibili and hidden:
+            continue
+
+        values = [ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, len(headers) + 1)]
+
+        # salta righe completamente vuote
+        if all(v is None or str(v).strip() == "" for v in values):
+            continue
+
+        data.append(values)
+        righe_lette += 1
+
+    df = pd.DataFrame(data, columns=headers)
+    return df, righe_totali, righe_lette
+
+
+def parse_data(valore):
+    if valore is None or pd.isna(valore):
+        return None
+
+    if isinstance(valore, datetime):
+        return valore.date()
+
+    if isinstance(valore, date):
+        return valore
+
     try:
-        return pd.read_excel(file)
-    except Exception as e:
-        st.error(f"Errore nella lettura del file: {e}")
+        return pd.to_datetime(valore, dayfirst=True).date()
+    except Exception:
         return None
 
 
-def normalizza_matricola(valore):
-    if pd.isna(valore):
+def parse_ora(valore):
+    """
+    Converte un valore Excel/stringa in un oggetto time.
+    Gestisce:
+    - datetime
+    - time
+    - frazioni Excel
+    - stringhe tipo 7:36, 07:36, 20, 20.00
+    """
+
+    if valore is None or pd.isna(valore):
         return None
+
+    if isinstance(valore, datetime):
+        return valore.time().replace(second=0, microsecond=0)
+
+    if isinstance(valore, time):
+        return valore.replace(second=0, microsecond=0)
+
+    if isinstance(valore, (int, float)):
+        # Excel spesso salva gli orari come frazione di giorno
+        if 0 <= valore < 1:
+            minuti = int(round(valore * 24 * 60))
+            h = minuti // 60
+            m = minuti % 60
+            return time(h % 24, m)
+
+        # Se è 20, significa 20:00
+        if 0 <= valore <= 24:
+            return time(int(valore) % 24, 0)
 
     testo = str(valore).strip()
 
     if testo.lower() in ["none", "nan", ""]:
         return None
 
-    # Se arriva come 141212.0 lo trasformo in 141212
-    if testo.endswith(".0"):
-        testo = testo[:-2]
+    testo = testo.replace(".", ":")
 
-    return testo
-
-
-def normalizza_data(valore):
-    if pd.isna(valore):
+    match = re.search(r"(\d{1,2})(?::(\d{1,2}))?", testo)
+    if not match:
         return None
 
-    try:
-        return pd.to_datetime(valore).date()
-    except Exception:
+    h = int(match.group(1))
+    m = int(match.group(2)) if match.group(2) is not None else 0
+
+    if h > 23 or m > 59:
         return None
 
+    return time(h, m)
 
-def crea_data_da_giorno(anno, mese, giorno):
-    try:
-        giorno_int = int(giorno)
-        return datetime(anno, mese, giorno_int).date()
-    except Exception:
+
+def unisci_data_ora(data_base, ora_base):
+    if data_base is None or ora_base is None:
         return None
 
+    return datetime.combine(data_base, ora_base)
 
-def parse_ora(testo):
+
+def format_dt(dt):
+    if dt is None:
+        return ""
+    return dt.strftime("%d/%m/%Y %H:%M")
+
+
+def format_ora(dt):
+    if dt is None:
+        return ""
+    return dt.strftime("%H:%M")
+
+
+def minuti_sovrapposizione(start_a, end_a, start_b, end_b):
+    start = max(start_a, start_b)
+    end = min(end_a, end_b)
+
+    if start < end:
+        minuti = int((end - start).total_seconds() // 60)
+        return start, end, minuti
+
+    return None, None, 0
+
+
+# ============================================================
+# TIMBRATURE FILE ANOMALIE
+# ============================================================
+
+def trova_colonne_ent_usc(df):
     """
-    Converte stringhe tipo:
-    8
-    08
-    8:00
-    08:00
-    in minuti dalla mezzanotte.
-    """
-    if testo is None:
-        return None
-
-    testo = str(testo).strip()
-
-    if ":" in testo:
-        pezzi = testo.split(":")
-        try:
-            ore = int(pezzi[0])
-            minuti = int(pezzi[1])
-            return ore * 60 + minuti
-        except Exception:
-            return None
-
-    try:
-        ore = int(testo)
-        return ore * 60
-    except Exception:
-        return None
-
-
-def estrai_intervalli_da_testo(testo):
-    """
-    Cerca intervalli orari in testi tipo:
-    8-20 / 20-8 DIRIGENZA
-    14 - 20 / 20 - 8 DIRIGENZA
-    08:00-14:00
-    20:00 - 08:00
+    Trova le colonne Ent./Usc. e le accoppia in ordine.
+    Questo è più robusto anche se Excel ha rinominato duplicati come Usc. 5.1.
     """
 
-    if pd.isna(testo):
-        return []
+    colonne = list(df.columns)
 
-    testo = str(testo)
+    ent_cols = []
+    usc_cols = []
 
-    if testo.lower() in ["none", "nan", ""]:
-        return []
+    for col in colonne:
+        col_norm = normalizza_testo(col)
 
-    pattern = r"(\d{1,2}(?::\d{2})?)\s*-\s*(\d{1,2}(?::\d{2})?)"
-    matches = re.findall(pattern, testo)
+        if col_norm.startswith("ENT"):
+            ent_cols.append(col)
+
+        if col_norm.startswith("USC"):
+            usc_cols.append(col)
+
+    # Mantiene l'ordine effettivo nel file
+    coppie = []
+    max_len = min(len(ent_cols), len(usc_cols))
+
+    for i in range(max_len):
+        coppie.append((ent_cols[i], usc_cols[i]))
+
+    return coppie
+
+
+def ricostruisci_timbrature_da_riga(riga, data_lavoro, coppie_ent_usc):
+    """
+    Da una riga del file Anomalie ricostruisce gli intervalli lavorati:
+    Ent. 1 - Usc. 1
+    Ent. 2 - Usc. 2
+    ...
+    """
 
     intervalli = []
 
-    for inizio_txt, fine_txt in matches:
-        inizio = parse_ora(inizio_txt)
-        fine = parse_ora(fine_txt)
+    for idx, (col_ent, col_usc) in enumerate(coppie_ent_usc, start=1):
+        ora_ent = parse_ora(riga.get(col_ent))
+        ora_usc = parse_ora(riga.get(col_usc))
+
+        if ora_ent is None or ora_usc is None:
+            continue
+
+        inizio = unisci_data_ora(data_lavoro, ora_ent)
+        fine = unisci_data_ora(data_lavoro, ora_usc)
 
         if inizio is None or fine is None:
             continue
 
-        # Se la fine è minore o uguale all'inizio, considero turno a cavallo della mezzanotte
+        # Se l'uscita è minore o uguale all'entrata, considero passaggio di mezzanotte
         if fine <= inizio:
-            fine = fine + 24 * 60
+            fine = fine + timedelta(days=1)
 
-        intervalli.append((inizio, fine))
+        intervalli.append({
+            "progressivo": idx,
+            "colonna_entrata": col_ent,
+            "colonna_uscita": col_usc,
+            "entrata": inizio,
+            "uscita": fine,
+            "testo": f"{format_ora(inizio)} - {format_ora(fine)}"
+        })
 
     return intervalli
 
 
-def minuti_to_ora(minuti):
+# ============================================================
+# FASCE FILE PIANIFICAZIONE PD
+# ============================================================
+
+def estrai_fasce_da_testo(testo, solo_notturna_se_presente=True):
     """
-    Converte minuti in formato HH:MM.
-    Gestisce anche orari oltre la mezzanotte.
+    Estrae fasce tipo:
+    20-8
+    20:00-08:00
+    14 - 20 / 20 - 8 DIRIGENZA
+
+    Se solo_notturna_se_presente=True e nel testo è presente una fascia notturna
+    tipo 20-8, usa solo quella, per evitare falsi positivi sulle diciture composite.
     """
-    minuti = int(minuti)
-    minuti_mod = minuti % (24 * 60)
-    ore = minuti_mod // 60
-    mins = minuti_mod % 60
-    return f"{ore:02d}:{mins:02d}"
+
+    if testo is None or pd.isna(testo):
+        return []
+
+    testo = str(testo).strip()
+
+    if testo.lower() in ["none", "nan", ""]:
+        return []
+
+    pattern = r"(\d{1,2}(?::\d{1,2})?)\s*-\s*(\d{1,2}(?::\d{1,2})?)"
+    matches = re.findall(pattern, testo)
+
+    fasce = []
+
+    for start_txt, end_txt in matches:
+        start_time = parse_ora(start_txt)
+        end_time = parse_ora(end_txt)
+
+        if start_time is None or end_time is None:
+            continue
+
+        notturna = end_time <= start_time
+
+        fasce.append({
+            "testo_fascia": f"{start_txt}-{end_txt}",
+            "ora_inizio": start_time,
+            "ora_fine": end_time,
+            "notturna": notturna
+        })
+
+    if solo_notturna_se_presente:
+        fasce_notturne = [f for f in fasce if f["notturna"]]
+        if fasce_notturne:
+            return fasce_notturne
+
+    return fasce
 
 
-def calcola_sovrapposizione(intervalli_a, intervalli_b):
+def costruisci_intervallo_pd(data_cal, fascia):
+    start_dt = datetime.combine(data_cal, fascia["ora_inizio"])
+    end_dt = datetime.combine(data_cal, fascia["ora_fine"])
+
+    if end_dt <= start_dt:
+        end_dt = end_dt + timedelta(days=1)
+
+    return start_dt, end_dt
+
+
+def crea_data_da_cal(anno, mese, cal):
+    try:
+        cal_int = int(cal)
+        return date(int(anno), int(mese), cal_int)
+    except Exception:
+        return None
+
+
+def trasforma_pianificazione_pd(df_pd, anno, mese, solo_notturna_se_presente=True):
     """
-    Restituisce lista di sovrapposizioni tra due liste di intervalli.
-    Ogni intervallo è espresso in minuti.
-    """
-    risultati = []
-
-    for a_start, a_end in intervalli_a:
-        for b_start, b_end in intervalli_b:
-            start = max(a_start, b_start)
-            end = min(a_end, b_end)
-
-            if start < end:
-                risultati.append({
-                    "inizio_sovrapposizione": minuti_to_ora(start),
-                    "fine_sovrapposizione": minuti_to_ora(end),
-                    "minuti_sovrapposizione": end - start
-                })
-
-    return risultati
-
-
-def trasforma_file2(df_b, anno, mese):
-    """
-    Trasforma il file 2 da formato largo a formato lungo.
-
-    Da:
-    Cal | Orario 1 | Decodifica Orario 1 | Matricola 1 | ...
-
-    A:
-    Data | Progressivo | Orario | Decodifica Orario | Matricola
+    Trasforma il file Pianificazione PD da formato largo a formato lungo:
+    ogni riga diventa una singola assegnazione PD.
     """
 
     righe = []
 
-    for _, row in df_b.iterrows():
-        giorno = row.get("Cal")
-        data = crea_data_da_giorno(anno, mese, giorno)
+    if "Cal" not in df_pd.columns:
+        return pd.DataFrame()
 
-        if data is None:
+    for _, row in df_pd.iterrows():
+        giorno_cal = row.get("Cal")
+        data_cal = crea_data_da_cal(anno, mese, giorno_cal)
+
+        if data_cal is None:
             continue
 
         for i in range(1, 11):
-            col_orario = f"Orario {i}"
-            col_dec_orario = f"Decodifica di Orario {i}"
-            col_matricola = f"Matricola {i}"
             col_dec_matricola = f"Decodifica di Matricola {i}"
+            col_matricola = f"Matricola {i}"
+            col_dec_orario = f"Decodifica di Orario {i}"
+            col_orario = f"Orario {i}"
 
-            if col_orario not in df_b.columns:
+            if col_dec_matricola not in df_pd.columns or col_dec_orario not in df_pd.columns:
                 continue
 
-            orario = row.get(col_orario)
-            dec_orario = row.get(col_dec_orario) if col_dec_orario in df_b.columns else None
-            matricola = row.get(col_matricola) if col_matricola in df_b.columns else None
-            dec_matricola = row.get(col_dec_matricola) if col_dec_matricola in df_b.columns else None
+            nominativo_pd = row.get(col_dec_matricola)
+            fascia_testo = row.get(col_dec_orario)
 
-            matricola_norm = normalizza_matricola(matricola)
-
-            if matricola_norm is None:
+            if nominativo_pd is None or pd.isna(nominativo_pd):
                 continue
 
-            righe.append({
-                "Data": data,
-                "Progressivo": i,
-                "Orario": orario,
-                "Decodifica Orario": dec_orario,
-                "Matricola": matricola_norm,
-                "Decodifica Matricola": dec_matricola,
-                "Intervalli": estrai_intervalli_da_testo(dec_orario)
-            })
+            if str(nominativo_pd).strip().lower() in ["none", "nan", ""]:
+                continue
+
+            fasce = estrai_fasce_da_testo(
+                fascia_testo,
+                solo_notturna_se_presente=solo_notturna_se_presente
+            )
+
+            for fascia in fasce:
+                inizio_pd, fine_pd = costruisci_intervallo_pd(data_cal, fascia)
+
+                righe.append({
+                    "Cal": giorno_cal,
+                    "Data inizio PD": inizio_pd.date(),
+                    "Progressivo": i,
+                    "Nominativo PD": nominativo_pd,
+                    "Nominativo PD normalizzato": normalizza_testo(nominativo_pd),
+                    "Matricola PD": row.get(col_matricola) if col_matricola in df_pd.columns else "",
+                    "Orario PD": row.get(col_orario) if col_orario in df_pd.columns else "",
+                    "Fascia PD": fascia_testo,
+                    "Fascia estratta": fascia["testo_fascia"],
+                    "Inizio PD": inizio_pd,
+                    "Fine PD": fine_pd,
+                    "PD notturna": "Sì" if fascia["notturna"] else "No"
+                })
 
     return pd.DataFrame(righe)
 
 
-def prepara_file1(df_a, colonna_fascia_file1):
-    """
-    Normalizza il file 1.
-    """
+# ============================================================
+# GENERAZIONE REPORT
+# ============================================================
 
-    df = df_a.copy()
+def genera_report(df_anomalie, df_pd_lungo):
+    coppie_ent_usc = trova_colonne_ent_usc(df_anomalie)
 
-    df["Matricola_norm"] = df["Matricola"].apply(normalizza_matricola)
-    df["Data_norm"] = df["Data Rif."].apply(normalizza_data)
-    df["Fascia_file1"] = df[colonna_fascia_file1].astype(str)
-    df["Intervalli_file1"] = df["Fascia_file1"].apply(estrai_intervalli_da_testo)
+    risultati = []
+    righe_senza_timbrature = 0
 
-    return df
+    for idx, riga in df_anomalie.iterrows():
+        cognome = riga.get("Cognome")
+        nome = riga.get("Nome")
+        giorno = parse_data(riga.get("Giorno"))
 
-
-def genera_report(df_a_norm, df_b_long):
-    anomalie = []
-
-    for _, riga_a in df_a_norm.iterrows():
-        matricola_a = riga_a.get("Matricola_norm")
-        data_a = riga_a.get("Data_norm")
-
-        if matricola_a is None or data_a is None:
+        if giorno is None:
             continue
 
-        corrispondenze_b = df_b_long[
-            (df_b_long["Matricola"] == matricola_a) &
-            (df_b_long["Data"] == data_a)
-        ]
+        intervalli_lavoro = ricostruisci_timbrature_da_riga(
+            riga,
+            giorno,
+            coppie_ent_usc
+        )
 
-        if corrispondenze_b.empty:
+        if not intervalli_lavoro:
+            righe_senza_timbrature += 1
             continue
 
-        for _, riga_b in corrispondenze_b.iterrows():
-            intervalli_a = riga_a.get("Intervalli_file1", [])
-            intervalli_b = riga_b.get("Intervalli", [])
+        # Prima filtro ampio per ridurre confronti:
+        # stesso nominativo e PD che può toccare quel giorno.
+        possibili_pd = []
 
-            sovrapposizioni = calcola_sovrapposizione(intervalli_a, intervalli_b)
+        for _, pd_row in df_pd_lungo.iterrows():
+            if not nominativo_match(cognome, nome, pd_row.get("Nominativo PD")):
+                continue
 
-            if sovrapposizioni:
-                for sov in sovrapposizioni:
-                    anomalie.append({
-                        "Tipo anomalia": "Sovrapposizione oraria",
-                        "Matricola": matricola_a,
-                        "Cognome": riga_a.get("Cognome"),
-                        "Nome": riga_a.get("Nome"),
-                        "Data": data_a,
-                        "Fascia file 1": riga_a.get("Fascia_file1"),
-                        "Orario file 2": riga_b.get("Orario"),
-                        "Fascia file 2": riga_b.get("Decodifica Orario"),
-                        "Progressivo file 2": riga_b.get("Progressivo"),
-                        "Inizio sovrapposizione": sov["inizio_sovrapposizione"],
-                        "Fine sovrapposizione": sov["fine_sovrapposizione"],
-                        "Minuti sovrapposizione": sov["minuti_sovrapposizione"],
-                        "Nota": "Stessa matricola, stessa data, fasce orarie sovrapposte"
+            possibili_pd.append(pd_row)
+
+        for intervallo in intervalli_lavoro:
+            inizio_lav = intervallo["entrata"]
+            fine_lav = intervallo["uscita"]
+
+            for pd_row in possibili_pd:
+                inizio_pd = pd_row.get("Inizio PD")
+                fine_pd = pd_row.get("Fine PD")
+
+                if inizio_pd is None or fine_pd is None:
+                    continue
+
+                start_overlap, end_overlap, minuti = minuti_sovrapposizione(
+                    inizio_lav,
+                    fine_lav,
+                    inizio_pd,
+                    fine_pd
+                )
+
+                if minuti > 0:
+                    risultati.append({
+                        "Cognome": cognome,
+                        "Nome": nome,
+                        "Nominativo Anomalie": f"{cognome} {nome}",
+                        "Data timbratura": giorno.strftime("%d/%m/%Y"),
+                        "Entrata": format_dt(inizio_lav),
+                        "Uscita": format_dt(fine_lav),
+                        "Intervallo timbratura": f"{format_dt(inizio_lav)} - {format_dt(fine_lav)}",
+                        "Cal pianificazione": pd_row.get("Cal"),
+                        "Nominativo PD trovato": pd_row.get("Nominativo PD"),
+                        "Orario PD": pd_row.get("Orario PD"),
+                        "Fascia PD": pd_row.get("Fascia PD"),
+                        "Fascia estratta": pd_row.get("Fascia estratta"),
+                        "Inizio PD": format_dt(inizio_pd),
+                        "Fine PD": format_dt(fine_pd),
+                        "Inizio sovrapposizione": format_dt(start_overlap),
+                        "Fine sovrapposizione": format_dt(end_overlap),
+                        "Minuti sovrapposti": minuti,
+                        "Ore sovrapposte": round(minuti / 60, 2),
+                        "Tipo anomalia": "Sovrapposizione tra timbratura e fascia PD",
+                        "Nota": (
+                            "Il soggetto risulta timbrato in un intervallo che si sovrappone "
+                            "alla fascia di pronta disponibilità pianificata."
+                        )
                     })
-            else:
-                anomalie.append({
-                    "Tipo anomalia": "Coincidenza matricola/data senza orario interpretabile",
-                    "Matricola": matricola_a,
-                    "Cognome": riga_a.get("Cognome"),
-                    "Nome": riga_a.get("Nome"),
-                    "Data": data_a,
-                    "Fascia file 1": riga_a.get("Fascia_file1"),
-                    "Orario file 2": riga_b.get("Orario"),
-                    "Fascia file 2": riga_b.get("Decodifica Orario"),
-                    "Progressivo file 2": riga_b.get("Progressivo"),
-                    "Inizio sovrapposizione": "",
-                    "Fine sovrapposizione": "",
-                    "Minuti sovrapposizione": "",
-                    "Nota": "Presente nello stesso giorno nei due file, ma una delle due fasce non contiene un intervallo orario leggibile"
-                })
 
-    return pd.DataFrame(anomalie)
+    report = pd.DataFrame(risultati)
+
+    return report, coppie_ent_usc, righe_senza_timbrature
 
 
-def crea_excel_report(df_report, df_file2_trasformato):
+def crea_file_excel_report(report, df_pd_lungo, coppie_ent_usc):
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_report.to_excel(writer, index=False, sheet_name="Anomalie")
-        df_file2_trasformato.drop(columns=["Intervalli"], errors="ignore").to_excel(
-            writer,
-            index=False,
-            sheet_name="File2 trasformato"
+        report.to_excel(writer, index=False, sheet_name="Anomalie rilevate")
+
+        df_pd_export = df_pd_lungo.copy()
+        for col in ["Inizio PD", "Fine PD"]:
+            if col in df_pd_export.columns:
+                df_pd_export[col] = df_pd_export[col].apply(format_dt)
+
+        df_pd_export.to_excel(writer, index=False, sheet_name="PD trasformata")
+
+        df_coppie = pd.DataFrame(
+            [{"Entrata": e, "Uscita": u} for e, u in coppie_ent_usc]
         )
+        df_coppie.to_excel(writer, index=False, sheet_name="Colonne Ent-Usc usate")
 
         workbook = writer.book
-
-        formato_header = workbook.add_format({
+        header_format = workbook.add_format({
             "bold": True,
             "bg_color": "#D9EAF7",
             "border": 1
         })
-
-        formato_bordo = workbook.add_format({
+        cell_format = workbook.add_format({
             "border": 1
         })
 
-        for sheet_name in writer.sheets:
-            worksheet = writer.sheets[sheet_name]
+        for sheet_name, worksheet in writer.sheets.items():
             worksheet.freeze_panes(1, 0)
 
-            if sheet_name == "Anomalie":
-                df = df_report
+            if sheet_name == "Anomalie rilevate":
+                df_ref = report
+            elif sheet_name == "PD trasformata":
+                df_ref = df_pd_export
             else:
-                df = df_file2_trasformato.drop(columns=["Intervalli"], errors="ignore")
+                df_ref = df_coppie
 
-            for col_num, value in enumerate(df.columns.values):
-                worksheet.write(0, col_num, value, formato_header)
-                worksheet.set_column(col_num, col_num, 22)
+            for col_num, value in enumerate(df_ref.columns):
+                worksheet.write(0, col_num, value, header_format)
+                worksheet.set_column(col_num, col_num, 24)
 
-            for row_num in range(1, len(df) + 1):
-                for col_num in range(len(df.columns)):
-                    worksheet.write(row_num, col_num, df.iloc[row_num - 1, col_num], formato_bordo)
+            for row_num in range(1, len(df_ref) + 1):
+                for col_num in range(len(df_ref.columns)):
+                    worksheet.write(row_num, col_num, df_ref.iloc[row_num - 1, col_num], cell_format)
 
     output.seek(0)
     return output
 
 
-# =========================
-# INTERFACCIA APP
-# =========================
+# ============================================================
+# INTERFACCIA STREAMLIT
+# ============================================================
 
 st.subheader("1. Caricamento file")
 
-file_a = st.file_uploader("Carica il primo file Excel", type=["xlsx"], key="file_a")
-file_b = st.file_uploader("Carica il secondo file Excel", type=["xlsx"], key="file_b")
+file_anomalie = st.file_uploader(
+    "Carica il file Anomalie",
+    type=["xlsx"],
+    key="file_anomalie"
+)
 
-st.subheader("2. Parametri del confronto")
+file_pd = st.file_uploader(
+    "Carica il file Pianificazione PD",
+    type=["xlsx"],
+    key="file_pd"
+)
 
-col_mese, col_anno = st.columns(2)
+st.subheader("2. Parametri")
 
-with col_mese:
+col_a, col_b, col_c = st.columns(3)
+
+with col_a:
     mese = st.selectbox(
-        "Mese di riferimento del file 2",
+        "Mese della pianificazione PD",
         options=list(range(1, 13)),
         index=3,
         format_func=lambda x: {
@@ -369,91 +633,142 @@ with col_mese:
         }[x]
     )
 
-with col_anno:
+with col_b:
     anno = st.number_input(
-        "Anno di riferimento del file 2",
+        "Anno della pianificazione PD",
         min_value=2020,
         max_value=2035,
         value=2026,
         step=1
     )
 
-if file_a is not None and file_b is not None:
-    df_a = carica_excel(file_a)
-    df_b = carica_excel(file_b)
+with col_c:
+    solo_righe_visibili = st.checkbox(
+        "Leggi solo righe visibili/filtrate del file Anomalie",
+        value=True
+    )
 
-    if df_a is not None and df_b is not None:
+solo_notturna = st.checkbox(
+    "Se una fascia contiene una parte notturna tipo 20-8, considera solo quella",
+    value=True,
+    help=(
+        "Utile quando la decodifica contiene diciture composite tipo "
+        "'8-20 / 20-8 DIRIGENZA' ma l'anomalia da cercare riguarda la parte 20-8."
+    )
+)
 
-        st.subheader("3. Anteprima dei file")
+if file_anomalie is not None and file_pd is not None:
 
-        col1, col2 = st.columns(2)
+    st.subheader("3. Lettura file")
 
-        with col1:
-            st.write("Anteprima file 1")
-            st.dataframe(df_a.head(20), use_container_width=True)
+    df_anomalie, righe_totali, righe_lette = leggi_excel_righe_visibili(
+        file_anomalie,
+        solo_visibili=solo_righe_visibili
+    )
 
-        with col2:
-            st.write("Anteprima file 2")
-            st.dataframe(df_b.head(20), use_container_width=True)
+    # Per la pianificazione PD di solito non serve rispettare filtri
+    df_pd, righe_pd_totali, righe_pd_lette = leggi_excel_righe_visibili(
+        file_pd,
+        solo_visibili=False
+    )
 
-        st.subheader("4. Scelta della colonna fascia/orario del file 1")
+    st.write(f"Righe dati file Anomalie lette: **{righe_lette}** su **{righe_totali}**")
+    st.write(f"Righe dati file Pianificazione PD lette: **{righe_pd_lette}**")
 
-        colonne_file1 = list(df_a.columns)
+    if df_anomalie.empty:
+        st.error("Il file Anomalie risulta vuoto o non leggibile.")
+        st.stop()
 
-        default_colonna = "Desc. Or.PD" if "Desc. Or.PD" in colonne_file1 else colonne_file1[0]
+    if df_pd.empty:
+        st.error("Il file Pianificazione PD risulta vuoto o non leggibile.")
+        st.stop()
 
-        colonna_fascia_file1 = st.selectbox(
-            "Quale colonna del file 1 contiene la fascia/orario da confrontare?",
-            options=colonne_file1,
-            index=colonne_file1.index(default_colonna)
-        )
+    st.subheader("4. Anteprima file")
 
-        st.info(
-            "Nel file 2 l'app usa automaticamente le colonne ripetute "
-            "Orario 1-10, Decodifica di Orario 1-10 e Matricola 1-10."
-        )
+    col1, col2 = st.columns(2)
 
-        if st.button("Avvia confronto"):
+    with col1:
+        st.write("Anteprima file Anomalie")
+        st.dataframe(df_anomalie.head(20), use_container_width=True)
 
-            colonne_obbligatorie_file1 = ["Matricola", "Cognome", "Nome", "Data Rif."]
-            colonne_mancanti = [c for c in colonne_obbligatorie_file1 if c not in df_a.columns]
+    with col2:
+        st.write("Anteprima file Pianificazione PD")
+        st.dataframe(df_pd.head(20), use_container_width=True)
 
-            if colonne_mancanti:
-                st.error(f"Nel file 1 mancano queste colonne obbligatorie: {colonne_mancanti}")
-            elif "Cal" not in df_b.columns:
-                st.error("Nel file 2 manca la colonna obbligatoria 'Cal'.")
-            else:
-                df_a_norm = prepara_file1(df_a, colonna_fascia_file1)
-                df_b_long = trasforma_file2(df_b, int(anno), int(mese))
+    st.subheader("5. Controllo colonne obbligatorie")
 
-                st.subheader("5. File 2 trasformato")
-                st.write(
-                    "Questa tabella mostra il file 2 trasformato in formato confrontabile: "
-                    "una riga per ogni matricola/fascia/data."
+    colonne_obbligatorie_anomalie = ["Cognome", "Nome", "Giorno"]
+    mancanti_anomalie = [c for c in colonne_obbligatorie_anomalie if c not in df_anomalie.columns]
+
+    if mancanti_anomalie:
+        st.error(f"Nel file Anomalie mancano queste colonne obbligatorie: {mancanti_anomalie}")
+        st.stop()
+
+    if "Cal" not in df_pd.columns:
+        st.error("Nel file Pianificazione PD manca la colonna obbligatoria 'Cal'.")
+        st.stop()
+
+    coppie_preview = trova_colonne_ent_usc(df_anomalie)
+
+    if not coppie_preview:
+        st.error("Non sono state trovate coppie di colonne Ent./Usc. nel file Anomalie.")
+        st.stop()
+
+    st.write("Coppie Ent./Usc. rilevate nel file Anomalie:")
+    st.dataframe(
+        pd.DataFrame([{"Entrata": e, "Uscita": u} for e, u in coppie_preview]),
+        use_container_width=True
+    )
+
+    if st.button("Avvia confronto"):
+
+        with st.spinner("Elaborazione in corso..."):
+            df_pd_lungo = trasforma_pianificazione_pd(
+                df_pd,
+                anno=int(anno),
+                mese=int(mese),
+                solo_notturna_se_presente=solo_notturna
+            )
+
+            if df_pd_lungo.empty:
+                st.error(
+                    "La pianificazione PD trasformata è vuota. "
+                    "Controlla che siano presenti le colonne Decodifica di Matricola 1-10 "
+                    "e Decodifica di Orario 1-10."
                 )
-                st.dataframe(
-                    df_b_long.drop(columns=["Intervalli"], errors="ignore"),
-                    use_container_width=True
-                )
+                st.stop()
 
-                report = genera_report(df_a_norm, df_b_long)
+            report, coppie_ent_usc, righe_senza_timbrature = genera_report(
+                df_anomalie,
+                df_pd_lungo
+            )
 
-                st.subheader("6. Report anomalie")
+        st.subheader("6. Pianificazione PD trasformata")
 
-                if report.empty:
-                    st.success("Nessuna anomalia trovata con i criteri attuali.")
-                else:
-                    st.warning(f"Sono state trovate {len(report)} possibili anomalie.")
-                    st.dataframe(report, use_container_width=True)
+        df_pd_preview = df_pd_lungo.copy()
+        df_pd_preview["Inizio PD"] = df_pd_preview["Inizio PD"].apply(format_dt)
+        df_pd_preview["Fine PD"] = df_pd_preview["Fine PD"].apply(format_dt)
 
-                    file_report = crea_excel_report(report, df_b_long)
+        st.dataframe(df_pd_preview, use_container_width=True)
 
-                    st.download_button(
-                        label="Scarica report anomalie in Excel",
-                        data=file_report,
-                        file_name="report_anomalie.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+        st.subheader("7. Report anomalie")
+
+        st.write(f"Righe Anomalie senza timbrature Ent./Usc. interpretabili: **{righe_senza_timbrature}**")
+
+        if report.empty:
+            st.success("Nessuna sovrapposizione trovata con i criteri attuali.")
+        else:
+            st.warning(f"Sono state trovate **{len(report)}** sovrapposizioni/anomalie.")
+            st.dataframe(report, use_container_width=True)
+
+            excel_report = crea_file_excel_report(report, df_pd_lungo, coppie_ent_usc)
+
+            st.download_button(
+                label="Scarica report anomalie in Excel",
+                data=excel_report,
+                file_name="report_anomalie_pd.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
 else:
-    st.warning("Carica entrambi i file Excel per iniziare il confronto.")
+    st.info("Carica entrambi i file Excel per avviare il confronto.")
