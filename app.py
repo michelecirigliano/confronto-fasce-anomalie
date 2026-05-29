@@ -667,10 +667,9 @@ if file_anomalie is not None and file_pd is not None:
     )
 
     # Per la pianificazione PD di solito non serve rispettare filtri
-    df_pd, righe_pd_totali, righe_pd_lette = leggi_excel_righe_visibili(
-        file_pd,
-        solo_visibili=False
-    )
+    file_pd.seek(0)
+    df_pd = pd.read_excel(file_pd)
+    righe_pd_lette = len(df_pd)
 
     st.write(f"Righe dati file Anomalie lette: **{righe_lette}** su **{righe_totali}**")
     st.write(f"Righe dati file Pianificazione PD lette: **{righe_pd_lette}**")
