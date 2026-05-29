@@ -390,34 +390,100 @@ def crea_data_da_cal(anno, mese, cal):
         return None
 
 
-def trasforma_pianificazione_pd(df_pd, anno, mese, solo_notturna_se_presente=True):
+def trova_colonna(df, possibili_nomi):
     """
-    Trasforma il file Pianificazione PD da formato largo a formato lungo:
-    ogni riga diventa una singola assegnazione PD.
+    Cerca una colonna anche se ci sono differenze di spazi, maiuscole/minuscole
+    o piccoli cambi di intestazione.
+    """
+    colonne = list(df.columns)
+    colonne_norm = {normalizza_testo(c): c for c in colonne}
+
+    for nome in possibili_nomi:
+        nome_norm = normalizza_testo(nome)
+        if nome_norm in colonne_norm:
+            return colonne_norm[nome_norm]
+
+    return None
+
+
+def trasforma_pianificazione_pd(df_pd, anno, mese, solo_notturna_se_presente=False):
+    """
+    Trasforma il file Pianificazione PD da formato largo a formato lungo.
+
+    Cerca, per ogni giorno Cal, le coppie:
+    Orario 1 / Decodifica di Orario 1 / Matricola 1 / Decodifica di Matricola 1
+    fino a 10.
+
+    È più tollerante sui nomi delle colonne e non si blocca se alcune colonne
+    sono vuote o mancanti.
     """
 
     righe = []
 
-    if "Cal" not in df_pd.columns:
+    col_cal = trova_colonna(df_pd, ["Cal", "CAL"])
+    if col_cal is None:
+        st.error("Non trovo la colonna Cal nella pianificazione PD.")
+        st.write("Colonne presenti nel file Pianificazione PD:")
+        st.write(list(df_pd.columns))
         return pd.DataFrame()
 
     for _, row in df_pd.iterrows():
-        giorno_cal = row.get("Cal")
+        giorno_cal = row.get(col_cal)
         data_cal = crea_data_da_cal(anno, mese, giorno_cal)
 
         if data_cal is None:
             continue
 
         for i in range(1, 11):
-            col_dec_matricola = f"Decodifica di Matricola {i}"
-            col_matricola = f"Matricola {i}"
-            col_dec_orario = f"Decodifica di Orario {i}"
-            col_orario = f"Orario {i}"
+            col_dec_matricola = trova_colonna(
+                df_pd,
+                [
+                    f"Decodifica di Matricola {i}",
+                    f"Decodifica Matricola {i}",
+                    f"Descrizione Matricola {i}",
+                    f"Nominativo {i}",
+                    f"Nome {i}",
+                ]
+            )
 
-            if col_dec_matricola not in df_pd.columns or col_dec_orario not in df_pd.columns:
+            col_matricola = trova_colonna(
+                df_pd,
+                [
+                    f"Matricola {i}",
+                    f"Matricola{i}",
+                ]
+            )
+
+            col_dec_orario = trova_colonna(
+                df_pd,
+                [
+                    f"Decodifica di Orario {i}",
+                    f"Decodifica Orario {i}",
+                    f"Descrizione Orario {i}",
+                    f"Fascia {i}",
+                ]
+            )
+
+            col_orario = trova_colonna(
+                df_pd,
+                [
+                    f"Orario {i}",
+                    f"Orario{i}",
+                ]
+            )
+
+            if col_dec_orario is None:
                 continue
 
-            nominativo_pd = row.get(col_dec_matricola)
+            nominativo_pd = None
+
+            if col_dec_matricola is not None:
+                nominativo_pd = row.get(col_dec_matricola)
+
+            # fallback: se la decodifica nominativo è vuota, provo a usare Matricola
+            if (nominativo_pd is None or pd.isna(nominativo_pd) or str(nominativo_pd).strip().lower() in ["", "none", "nan"]) and col_matricola is not None:
+                nominativo_pd = row.get(col_matricola)
+
             fascia_testo = row.get(col_dec_orario)
 
             if nominativo_pd is None or pd.isna(nominativo_pd):
@@ -426,10 +492,16 @@ def trasforma_pianificazione_pd(df_pd, anno, mese, solo_notturna_se_presente=Tru
             if str(nominativo_pd).strip().lower() in ["none", "nan", ""]:
                 continue
 
+            if fascia_testo is None or pd.isna(fascia_testo):
+                continue
+
             fasce = estrai_fasce_da_testo(
                 fascia_testo,
                 solo_notturna_se_presente=solo_notturna_se_presente
             )
+
+            if not fasce:
+                continue
 
             for fascia in fasce:
                 inizio_pd, fine_pd = costruisci_intervallo_pd(data_cal, fascia)
@@ -440,8 +512,8 @@ def trasforma_pianificazione_pd(df_pd, anno, mese, solo_notturna_se_presente=Tru
                     "Progressivo": i,
                     "Nominativo PD": nominativo_pd,
                     "Nominativo PD normalizzato": normalizza_testo(nominativo_pd),
-                    "Matricola PD": row.get(col_matricola) if col_matricola in df_pd.columns else "",
-                    "Orario PD": row.get(col_orario) if col_orario in df_pd.columns else "",
+                    "Matricola PD": row.get(col_matricola) if col_matricola is not None else "",
+                    "Orario PD": row.get(col_orario) if col_orario is not None else "",
                     "Fascia PD": fascia_testo,
                     "Fascia estratta": fascia["testo_fascia"],
                     "Inizio PD": inizio_pd,
@@ -449,8 +521,19 @@ def trasforma_pianificazione_pd(df_pd, anno, mese, solo_notturna_se_presente=Tru
                     "PD notturna": "Sì" if fascia["notturna"] else "No"
                 })
 
-    return pd.DataFrame(righe)
+    df_out = pd.DataFrame(righe)
 
+    if df_out.empty:
+        st.error(
+            "La pianificazione PD trasformata è vuota. "
+            "Questo significa che l'app non ha trovato nominativi e fasce nelle coppie Orario/Matricola."
+        )
+        st.write("Colonne lette nel file Pianificazione PD:")
+        st.write(list(df_pd.columns))
+        st.write("Prime righe del file Pianificazione PD:")
+        st.dataframe(df_pd.head(20), use_container_width=True)
+
+    return df_out
 
 # ============================================================
 # GENERAZIONE REPORT
