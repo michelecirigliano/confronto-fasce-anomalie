@@ -650,10 +650,10 @@ with col_c:
 
 solo_notturna = st.checkbox(
     "Se una fascia contiene una parte notturna tipo 20-8, considera solo quella",
-    value=True,
+    value=False,
     help=(
-        "Utile quando la decodifica contiene diciture composite tipo "
-        "'8-20 / 20-8 DIRIGENZA' ma l'anomalia da cercare riguarda la parte 20-8."
+        "Se disattivato, l'app scompone tutte le fasce presenti, ad esempio "
+        "'8-20 / 20-8 DIRIGENZA'. Questa è la modalità più simile al report precedente."
     )
 )
 
